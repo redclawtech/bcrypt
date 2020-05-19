@@ -17,8 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <erl_interface.h>
 #include <ei.h>
+#include <erl_comm.h>
 #include <unistd.h>
 
 #include "erl_blf.h"
@@ -30,74 +30,14 @@
         ((unsigned char*)(s))[1] = (i) & 0xff;}
 
 #define BUFSIZE (1 << 16)
-#define CMD_SALT 0
-#define CMD_HASHPW 1
-
-typedef unsigned char byte;
+#define CMD_SALT "0"
+#define CMD_HASHPW "1"
 
 int ts_bcrypt(char *, const char *, const char *);
 void encode_salt(char *, u_int8_t *, u_int16_t, u_int8_t);
 
-/* These methods came from the Erlang port command tutorial:
- * http://www.erlang.org/doc/tutorial/c_port.html#4.2
- */
 static int
-read_buf(int fd, byte *buf, int len)
-{
-    int i, got = 0;
-    do {
-        if ((i = read(fd, buf+got, len-got)) <= 0) {
-            if (i == 0) return got;
-            if (errno != EINTR)
-                return got;
-            i = 0;
-        }
-        got += i;
-    } while (got < len);
-    return (len);
-}
-
-static int
-read_cmd(byte *buf)
-{
-    int len;
-    if (read_buf(0, buf, 2) != 2)
-        return 0;
-    len = dec_int16(buf);
-    if (read_buf(0, buf, len) != len)
-        return 0;
-    return 1;
-}
-
-static int
-write_buf(int fd, byte *buf, int len)
-{
-    int i, done = 0;
-    do {
-        if ((i = write(fd, buf+done, len-done)) < 0) {
-            if (errno != EINTR)
-                return (i);
-            i = 0;
-        }
-        done += i;
-    } while (done < len);
-    return (len);
-}
-
-static int
-write_cmd(byte *buf, int len)
-{
-    byte hd[2];
-    enc_int16(len, hd);
-    if (write_buf(1, hd, 2) != 2)
-        return 0;
-    if (write_buf(1, buf, len) != len)
-        return 0;
-    return 1;
-}
-
-static int
-process_reply(ETERM *pid, int cmd, const char *res)
+process_reply(erlang_pid *pid, int cmd, const char *res)
 {
     ETERM *result;
     int len, retval;
@@ -113,10 +53,10 @@ process_reply(ETERM *pid, int cmd, const char *res)
 }
 
 static int
-process_encode_salt(ETERM *pid, ETERM *data)
+process_encode_salt(char *buf, int *index)
 {
     int retval = 0;
-    ETERM *pattern, *cslt, *lr;
+    ETERM *pattern, *csalt, *lr;
     byte *csalt = NULL;
     long log_rounds = -1;
     int csaltlen = -1;
@@ -144,7 +84,7 @@ process_encode_salt(ETERM *pid, ETERM *data)
 }
 
 static int
-process_hashpw(ETERM *pid, ETERM *data)
+process_hashpw(char *buf, int *index)
 {
     int retval = 0;
     ETERM *pattern, *pwd, *slt, *pwd_bin, *slt_bin;
@@ -184,50 +124,49 @@ process_hashpw(ETERM *pid, ETERM *data)
 }
 
 static int
-process_command(unsigned char *buf)
+process_command(char *buf, int *index)
 {
-    int retval = 0;
-    ETERM *pattern, *tuple, *cmd, *port, *data;
-    pattern = erl_format("{Cmd, Port, Data}");
-    tuple = erl_decode(buf);
-    if (erl_match(pattern, tuple)) {
-        cmd = erl_var_content(pattern, "Cmd");
-        port = erl_var_content(pattern, "Port");
-        data = erl_var_content(pattern, "Data");
-        switch (ERL_INT_VALUE(cmd)) {
-        case CMD_SALT:
-            retval = process_encode_salt(port, data);
-            break;
-        case CMD_HASHPW:
-            retval = process_hashpw(port, data);
-            break;
-        };
-        erl_free_term(cmd);
-        erl_free_term(port);
-        erl_free_term(data);
-    }
-    erl_free_term(pattern);
-    erl_free_term(tuple);
-    return retval;
-}
+    int version, arity;
+    char cmd;
 
-static void
-loop(void)
-{
-    byte buf[BUFSIZE];
-    int retval = 0;
-    do {
-        if (read_cmd(buf) > 0)
-            retval = process_command(buf);
-        else
-            retval = 0;
-    } while (retval);
+    *index = 0;
+
+    if (ei_decode_tuple_header(buf, index, &arity) == 0)
+	{
+        if (arity == 3) {
+            if (ei_decode_char(buf, index, cmd) == 0)
+            {
+                switch (cmd) {
+                case CMD_SALT:
+                    return process_encode_salt(buf, index);
+                case CMD_HASHPW:
+                    return process_hashpw(buf, index);
+                };
+            }
+        }
+	}
+    // Return error tuple here
+	return handle_tuple_msg(buf, index, arity);
 }
 
 int
 main(int argc, char *argv[])
 {
-    erl_init(NULL, 0);
-    loop();
-    return 0;
+    byte buf[BUFSIZE];
+    int len;
+	int *index = &len;
+
+    ei_init();
+    
+    while (read_cmd(buf) > 0)
+	{
+		if (process_command((char *) buf, index))
+		{
+			fputs("bcrypt ran into an unexpected error.\n", stderr);
+			return EXIT_FAILURE;
+		}
+		write_cmd(buf, len);
+	}
+    
+    return EXIT_SUCCESS;
 }
